@@ -6,13 +6,14 @@ from torch.nn import functional as F
 
 
 class GroupedQueryAttention(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, n_kv_heads: int):
+    def __init__(self, d_model: int, n_heads: int, n_kv_heads: int, dropout: float):
         super().__init__()
         self.d_model = d_model
         self.n_heads = n_heads
         self.n_kv_heads = n_kv_heads
         self.head_dim = d_model // n_heads
         self.n_rep = n_heads // n_kv_heads  # Query heads per KV head
+        self.dropout = dropout
 
         assert self.head_dim * n_heads == d_model
         assert n_heads % n_kv_heads == 0
@@ -52,7 +53,9 @@ class GroupedQueryAttention(nn.Module):
         v = self._repeat_kv(v)
 
         # Attention
-        attn = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        attn = F.scaled_dot_product_attention(
+            q, k, v, is_causal=True, dropout_p=self.dropout if self.training else 0.0
+        )
         attn = attn.transpose(1, 2).contiguous().view(B, T, self.d_model)
 
         return self.out_linear(attn), (k, v)
@@ -76,31 +79,27 @@ class MoEGate(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, d_model: int, m: int) -> None:
+    def __init__(self, d_model: int, m: int, dropout: float) -> None:
         super().__init__()
         self.linear1 = nn.Linear(d_model, d_model * m)
         self.linear2 = nn.Linear(d_model * m, d_model)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.linear2(F.gelu(self.linear1(x)))
+        return self.linear2(self.dropout(F.gelu(self.linear1(x))))
 
 
 class MixtureOfExperts(nn.Module):
-    def __init__(self, d_model: int, m: int, num_experts: int, top_k: int) -> None:
+    def __init__(
+        self, d_model: int, m: int, num_experts: int, top_k: int, dropout: float
+    ) -> None:
         super().__init__()
         self.num_experts: int = num_experts
         self.top_k: int = top_k
         self.gate = MoEGate(d_model, num_experts, top_k)
-
-        # Batched expert weights for GPU-friendly computation
-        self.w1 = nn.Parameter(torch.empty(num_experts, d_model, d_model * m))
-        self.b1 = nn.Parameter(torch.zeros(num_experts, d_model * m))
-        self.w2 = nn.Parameter(torch.empty(num_experts, d_model * m, d_model))
-        self.b2 = nn.Parameter(torch.zeros(num_experts, d_model))
-
-        for i in range(num_experts):
-            nn.init.normal_(self.w1[i], std=0.02)
-            nn.init.normal_(self.w2[i], std=0.02)
+        self.experts = nn.ModuleList(
+            [MLP(d_model, m, dropout) for _ in range(num_experts)]
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -110,32 +109,35 @@ class MixtureOfExperts(nn.Module):
 
         # Get routing decisions
         expert_indices, expert_weights = self.gate(x)  # (B, T, top_k)
+        N = B * T
 
-        # Flatten
-        x_flat = x.view(-1, D)  # (N, D) where N = B*T
-        N = x_flat.size(0)
+        # Run ALL tokens through ALL experts (each is a single dense matmul)
+        # Stack results: (num_experts, N, D)
+        all_expert_outputs = torch.stack(
+            [expert(x.view(N, D)) for expert in self.experts]
+        )  # (num_experts, N, D)
 
-        # Gather selected expert parameters: run all N tokens through top_k experts
-        flat_indices = expert_indices.view(N * self.top_k)  # (N*top_k,)
+        # Gather the top_k expert outputs per token
+        # expert_indices: (B, T, top_k) -> (N, top_k)
+        flat_indices = expert_indices.view(N, self.top_k)
 
-        # Gather expert weights for selected experts
-        w1 = self.w1[flat_indices]  # (N*top_k, D, D*m)
-        b1 = self.b1[flat_indices]  # (N*top_k, D*m)
-        w2 = self.w2[flat_indices]  # (N*top_k, D*m, D)
-        b2 = self.b2[flat_indices]  # (N*top_k, D)
+        # Index into all_expert_outputs: for each token, pick its top_k experts
+        # flat_indices (N, top_k) -> (top_k, N) for gather along expert dim
+        flat_indices_t = flat_indices.t()  # (top_k, N)
 
-        # Repeat input for each top_k selection
-        x_rep = x_flat.unsqueeze(1).expand(N, self.top_k, D).reshape(N * self.top_k, D)
+        # Gather: for each top_k slot, select the right expert output per token
+        selected = torch.stack(
+            [
+                all_expert_outputs[flat_indices_t[k], torch.arange(N, device=x.device)]
+                for k in range(self.top_k)
+            ]
+        )  # (top_k, N, D)
 
-        # Batched expert forward: x @ w1 + b1 -> gelu -> @ w2 + b2
-        h = torch.bmm(x_rep.unsqueeze(1), w1).squeeze(1) + b1  # (N*top_k, D*m)
-        h = F.gelu(h)
-        expert_out = torch.bmm(h.unsqueeze(1), w2).squeeze(1) + b2  # (N*top_k, D)
+        selected = selected.permute(1, 0, 2)  # (N, top_k, D)
 
-        # Reshape and apply routing weights
-        expert_out = expert_out.view(N, self.top_k, D)  # (N, top_k, D)
+        # Apply routing weights
         weights = expert_weights.view(N, self.top_k, 1)  # (N, top_k, 1)
-        output = (expert_out * weights).sum(dim=1)  # (N, D)
+        output = (selected * weights).sum(dim=1)  # (N, D)
 
         return output.view(B, T, D)
 
@@ -158,19 +160,23 @@ class TransformerBlock(nn.Module):
         n_heads: int,
         n_kv_heads: int,
         m: int,
+        attn_dropout: float,
+        mlp_dropout: float,
         num_experts: Optional[int] = None,
         top_k: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.norm1 = RMSNorm(d_model)
-        self.attention = GroupedQueryAttention(d_model, n_heads, n_kv_heads)
+        self.attention = GroupedQueryAttention(
+            d_model, n_heads, n_kv_heads, attn_dropout
+        )
         self.norm2 = RMSNorm(d_model)
 
         # Use MoE if specified, otherwise standard MLP
         if num_experts is not None and top_k is not None:
-            self.mlp = MixtureOfExperts(d_model, m, num_experts, top_k)
+            self.mlp = MixtureOfExperts(d_model, m, num_experts, top_k, mlp_dropout)
         else:
-            self.mlp = MLP(d_model, m)
+            self.mlp = MLP(d_model, m, mlp_dropout)
 
     def forward(
         self, x: torch.Tensor
@@ -185,26 +191,43 @@ class GPT(nn.Module):
     def __init__(
         self,
         vocab_size: int,
+        tie_weights: bool,
         d_model: int,
         n_heads: int,
         n_kv_heads: int,
         m: int,
         num_layers: int,
         max_seq_length: int,
+        attn_dropout: float = 0.1,
+        mlp_dropout: float = 0.1,
         num_experts: Optional[int] = None,
         top_k: Optional[int] = None,
     ) -> None:
         super().__init__()
-        self.token_embedding = nn.Embedding(vocab_size, d_model)
         self.position_embedding = nn.Parameter(torch.zeros(1, max_seq_length, d_model))
+
+        self.token_embedding = nn.Embedding(vocab_size, d_model)
         self.layers = nn.ModuleList(
             [
-                TransformerBlock(d_model, n_heads, n_kv_heads, m, num_experts, top_k)
+                TransformerBlock(
+                    d_model,
+                    n_heads,
+                    n_kv_heads,
+                    m,
+                    attn_dropout,
+                    mlp_dropout,
+                    num_experts,
+                    top_k,
+                )
                 for _ in range(num_layers)
             ]
         )
         self.norm_f = nn.LayerNorm(d_model)
         self.output_linear = nn.Linear(d_model, vocab_size)
+
+        if tie_weights:
+            self.output_linear.weight = self.token_embedding.weight
+
         self.apply(self._init_weights)
 
     def _init_weights(self, module: nn.Module) -> None:
@@ -227,6 +250,7 @@ if __name__ == "__main__":
 
     model = GPT(
         vocab_size=256,
+        tie_weights=False,
         d_model=32,
         n_heads=4,
         n_kv_heads=1,
