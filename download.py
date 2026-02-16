@@ -66,8 +66,8 @@ if __name__ == "__main__":
         "https://dumps.wikimedia.org/enwiki/latest/enwiki-latest-pages-articles.xml.bz2"
     )
 
-    BZ2_FILE = "enwiki-latest-pages-articles.xml.bz2"
-    XML_FILE = "enwiki-latest-pages-articles.xml"
+    BZ2_FILE = "/mnt/ai/data/en-wiki/enwiki-latest-pages-articles.xml.bz2"
+    XML_FILE = "/mnt/ai/data/en-wiki/enwiki-latest-pages-articles.xml"
 
     # Step 1: Download
     if not os.path.exists(BZ2_FILE):

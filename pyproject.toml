@@ -6,7 +6,7 @@ readme = "README.md"
 authors = [
     { name = "Karan Ravindra", email = "21176108+karanravindra@users.noreply.github.com" }
 ]
-requires-python = ">=3.13"
+requires-python = ">=3.12"
 dependencies = [
     "ipykernel>=7.2.0",
     "ipywidgets>=8.1.8",
@@ -14,12 +14,16 @@ dependencies = [
     "matplotlib>=3.10.8",
     "ollama>=0.6.1",
     "pandas>=3.0.0",
+    "pillow>=12.1.1",
     "requests>=2.32.5",
     "torch>=2.10.0",
     "torchinfo>=1.8.0",
+    "torchmetrics[image]>=1.8.2",
     "torchvision>=0.25.0",
     "tqdm>=4.67.3",
+    "wandb>=0.25.0",
 ]
+
 
 [project.scripts]
 omni = "omni:main"
