@@ -1,7 +1,8 @@
 import asyncio
 import json
-from typing import List
 from itertools import product
+from typing import List
+
 from ollama import AsyncClient
 
 client = AsyncClient(host="http://192.168.2.52:11434")
@@ -133,12 +134,12 @@ async def generate_story(model: str):
     print(
         f"\nGenerating {total_stories} stories by iterating through all combinations..."
     )
-    print(f"  • {len(protagonists)} protagonists")
-    print(f"  • {len(settings)} settings")
-    print(f"  • {len(problems)} problems")
-    print(f"  • {len(helpers)} helpers")
-    print(f"  • {len(lessons)} lessons")
-    print(f"  • {len(ending_surprises)} ending surprises")
+    print(f"- {len(protagonists)} protagonists")
+    print(f"- {len(settings)} settings")
+    print(f"- {len(problems)} problems")
+    print(f"- {len(helpers)} helpers")
+    print(f"- {len(lessons)} lessons")
+    print(f"- {len(ending_surprises)} ending surprises")
     print("=" * 80)
 
     for story_num, (
@@ -150,13 +151,13 @@ async def generate_story(model: str):
         ending_surprise,
     ) in enumerate(all_combinations, 1):
         print(f"\n### STORY {story_num} of {total_stories} ###\n")
-        print(f"Story Elements:")
-        print(f"  • Protagonist: {protagonist}")
-        print(f"  • Setting: {setting}")
-        print(f"  • Problem: {problem}")
-        print(f"  • Helper: {helper}")
-        print(f"  • Lesson: {lesson}")
-        print(f"  • Surprise: {ending_surprise}")
+        print("Story Elements:")
+        print(f"- Protagonist: {protagonist}")
+        print(f"- Setting: {setting}")
+        print(f"- Problem: {problem}")
+        print(f"- Helper: {helper}")
+        print(f"- Lesson: {lesson}")
+        print(f"- Surprise: {ending_surprise}")
         print(f"\n{'-' * 80}\n")
 
         messages = [

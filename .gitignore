@@ -4,8 +4,7 @@ __pycache__
 
 .DS_Store
 
-data/
-_data/
+/data
 
 wandb/
 checkpoints/

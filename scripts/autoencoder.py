@@ -1,6 +1,7 @@
 import os
 
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
@@ -17,55 +18,74 @@ from omni.models.autoencoder import Autoencoder
 from omni.utils.dataset import TensorImageFolder
 from omni.utils.device import get_device
 
+# ==================
+# Deterministic Seeding
+# ==================
+SEED = 42
+
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+np.random.seed(SEED)
+
+# Ensure deterministic behavior on CUDA
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
+CONFIG = {
+    "dataset": "afhq_v2",
+    "train_batch_size": 64,
+    "lr": 8e-4,
+    "total_steps": 500,
+    "eval_interval": 100,
+    "eval_steps": 100,
+    "seed": SEED,
+}
+
 device = get_device()
 use_bf16 = device.type == "cuda" and torch.cuda.is_bf16_supported()
 
-# Create checkpoints directory
-checkpoint_dir = "./checkpoints"
-os.makedirs(checkpoint_dir, exist_ok=True)
 
 # Initialize Weights & Biases
-wandb.init(project="autoencoder", name="afhq_v2_baseline")
+run = wandb.init(project="omni", tags=["autoencoder", CONFIG["dataset"]], config=CONFIG)
 
-train_data = TensorImageFolder("./data/afhq_v2_preprocessed/train")
-test_data = TensorImageFolder("./data/afhq_v2_preprocessed/test")
+train_data = TensorImageFolder(f"./data/{CONFIG['dataset']}_preprocessed/train")
+test_data = TensorImageFolder(f"./data/{CONFIG['dataset']}_preprocessed/test")
 
 cpu_count = os.cpu_count() or 1
 num_workers = min(8, cpu_count // 2)
 
 train_loader = DataLoader(
     train_data,
-    batch_size=128,  # you can go higher now
+    batch_size=CONFIG["train_batch_size"],
     shuffle=True,
     num_workers=num_workers,
     pin_memory=True,
+    worker_init_fn=lambda x: np.random.seed(SEED + x),  # Seed workers
 )
 
 test_loader = DataLoader(
     test_data,
-    batch_size=512,  # you can go higher now
+    batch_size=512,
     shuffle=False,
     num_workers=num_workers,
     pin_memory=True,
+    worker_init_fn=lambda x: np.random.seed(SEED + x),  # Seed workers
 )
 
 
 step = 0
 
 model = Autoencoder().to(device)
+wandb.watch(model, log="all", log_freq=10)
 
-optimizer_ae = torch.optim.AdamW(model.parameters(), lr=8e-4)
+optimizer_ae = torch.optim.AdamW(model.parameters(), lr=CONFIG["lr"])
+# optimizer_ae = AdamW8bit(model.parameters(), lr=CONFIG["lr"])
 
 criterion_recon = nn.MSELoss()
 
 scaler = None  # not used for bf16
 
 print(summary(model, (1, 3, 128, 128), device=device.type))
-
-# Training configuration
-total_steps = 5000
-eval_interval = 500  # Run evaluation every N steps
-checkpoint_interval = 1000  # Save checkpoint every N steps
 
 
 # Create infinite iterator for training
@@ -78,7 +98,7 @@ def infinite_dataloader(dataloader):
 train_iter = infinite_dataloader(train_loader)
 
 step = 0
-pbar = tqdm(range(total_steps), desc="Training")
+pbar = tqdm(range(CONFIG["total_steps"]), desc="Training")
 first_eval = True
 
 for _ in pbar:
@@ -135,16 +155,10 @@ for _ in pbar:
         step=step,
     )
 
-    # Save checkpoint
-    if step % checkpoint_interval == 0:
-        checkpoint_path = os.path.join(checkpoint_dir, f"autoencoder_step_{step}.pt")
-        torch.save(model.state_dict(), checkpoint_path)
-        print(f"\nCheckpoint saved: {checkpoint_path}")
-
     # --------------------
     # Eval
     # --------------------
-    if step % eval_interval == 0:
+    if step % CONFIG["eval_interval"] == 0:
         model.eval()
 
         total_loss_recon = 0
@@ -183,17 +197,15 @@ for _ in pbar:
                     wandb.log({"eval/reconstruction_grid": grid_pil}, step=step)
                     first_eval = False
 
+                if batch_idx >= CONFIG["eval_steps"] - 1:
+                    break
+
         test_loss = total_loss_recon / len(test_loader.dataset)
         print(f"\nStep {step} - Test loss (recon): {test_loss:.6f}")
 
         # Log validation metrics to W&B
-        wandb.log({"val/loss_recon": test_loss}, step=step)
+        wandb.log({"val/ae_loss": test_loss}, step=step)
 
-
-# Save final model
-final_checkpoint_path = os.path.join(checkpoint_dir, "autoencoder_final.pt")
-torch.save(model.state_dict(), final_checkpoint_path)
-print(f"Final model saved: {final_checkpoint_path}")
 
 with torch.no_grad():
     images, _ = next(iter(test_loader))
@@ -207,6 +219,13 @@ plt.figure(figsize=(24, 16))
 plt.imshow(grid.permute(1, 2, 0))
 plt.axis("off")
 plt.show()
+
+# Log final reconstruction grid to W&B
+final_grid_pil = wandb.Image(
+    grid.permute(1, 2, 0).cpu().numpy(),
+    caption="Final Original (top) vs Reconstruction (bottom)",
+)
+wandb.log({"final_reconstruction_grid": final_grid_pil}, step=step)
 
 wandb.finish()
 print("W&B run finished")
